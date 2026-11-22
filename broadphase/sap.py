@@ -1,8 +1,7 @@
 """Broad-phase primitives for a 2-D physics world.
 
-This module is the only place that should contain the implementation.  Every
-public function below is a stub: it raises ``NotImplementedError`` until the
-contract in its docstring is implemented.
+This module is the only place that contains the implementation.  Every
+public function below honours the contract in its docstring.
 
 Data model
 ----------
@@ -32,6 +31,8 @@ lexicographically so callers can compare them directly with ``==``.
 
 from __future__ import annotations
 
+import math
+
 
 TOL = 1e-9
 
@@ -59,7 +60,19 @@ def sort_endpoints(boxes: list[dict], axis: int) -> list[tuple[float, str, int]]
     Coordinates are compared as exact values; ``TOL`` is not applied to the
     ordering (it is used by the overlap predicates).
     """
-    raise NotImplementedError
+    if axis not in (0, 1):
+        raise ValueError("axis must be 0 (x) or 1 (y)")
+
+    endpoints = []
+    for box in boxes:
+        box_id = box["id"]
+        endpoints.append((box["min"][axis], "min", box_id))
+        endpoints.append((box["max"][axis], "max", box_id))
+
+    # At equal coordinates every "min" precedes every "max" so touching boxes
+    # remain visible to the sweep; ties of the same kind resolve by box id.
+    endpoints.sort(key=lambda item: (item[0], 0 if item[1] == "min" else 1, item[2]))
+    return endpoints
 
 
 def sweep(boxes: list[dict], axis: int) -> list[tuple[int, int]]:
@@ -82,7 +95,23 @@ def sweep(boxes: list[dict], axis: int) -> list[tuple[int, int]]:
     or active-set states produced it.  ``[]`` is returned for fewer than two
     boxes.  Duplicate box ids are not a supported input.
     """
-    raise NotImplementedError
+    if axis not in (0, 1):
+        raise ValueError("axis must be 0 (x) or 1 (y)")
+
+    if len(boxes) < 2:
+        return []
+
+    pairs = set()
+    active = set()
+    for _coordinate, kind, box_id in sort_endpoints(boxes, axis):
+        if kind == "min":
+            for other_id in active:
+                pairs.add((min(box_id, other_id), max(box_id, other_id)))
+            active.add(box_id)
+        else:
+            active.discard(box_id)
+
+    return sorted(pairs)
 
 
 def hash_cells(box: dict, cell: float) -> list[tuple[int, int]]:
@@ -106,7 +135,35 @@ def hash_cells(box: dict, cell: float) -> list[tuple[int, int]]:
     pathological AABB cannot exhaust memory.  A non-positive or non-finite
     ``cell`` also raises ``ValueError``.
     """
-    raise NotImplementedError
+    if not math.isfinite(cell) or cell <= 0:
+        raise ValueError("cell must be a finite, strictly positive number")
+
+    x0, y0 = box["min"]
+    x1, y1 = box["max"]
+
+    cx_lo = math.floor(x0 / cell)
+    cx_hi = math.ceil(x1 / cell)
+    if cx_hi <= cx_lo:
+        # Degenerate (zero-width) extent: keep the single containing cell.
+        cx_hi = cx_lo + 1
+
+    cy_lo = math.floor(y0 / cell)
+    cy_hi = math.ceil(y1 / cell)
+    if cy_hi <= cy_lo:
+        cy_hi = cy_lo + 1
+
+    x_count = cx_hi - cx_lo
+    y_count = cy_hi - cy_lo
+    if x_count * y_count > MAX_CELLS:
+        raise ValueError(
+            f"cell coverage {x_count * y_count} exceeds MAX_CELLS={MAX_CELLS}"
+        )
+
+    return [
+        (cx, cy)
+        for cx in range(cx_lo, cx_hi)
+        for cy in range(cy_lo, cy_hi)
+    ]
 
 
 def grid_pairs(boxes: list[dict], cell: float) -> list[tuple[int, int]]:
@@ -124,7 +181,22 @@ def grid_pairs(boxes: list[dict], cell: float) -> list[tuple[int, int]]:
     cells appears once.  ``cell`` and the ``MAX_CELLS`` guard follow
     :func:`hash_cells`; ``[]`` is returned for fewer than two boxes.
     """
-    raise NotImplementedError
+    if len(boxes) < 2:
+        return []
+
+    buckets: dict[tuple[int, int], list[int]] = {}
+    for box in boxes:
+        for grid_cell in hash_cells(box, cell):
+            buckets.setdefault(grid_cell, []).append(box["id"])
+
+    pairs = set()
+    for occupants in buckets.values():
+        for i in range(len(occupants)):
+            for j in range(i + 1, len(occupants)):
+                a, b = occupants[i], occupants[j]
+                pairs.add((min(a, b), max(a, b)))
+
+    return sorted(pairs)
 
 
 def dedupe_pairs(pairs: list[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -136,7 +208,7 @@ def dedupe_pairs(pairs: list[tuple[int, int]]) -> list[tuple[int, int]]:
     sorted lexicographically.  Self-pairs are *kept* here (as ``(i, i)``);
     rejecting them is :func:`validate_pairs`'s job.
     """
-    raise NotImplementedError
+    return sorted({(min(a, b), max(a, b)) for a, b in pairs})
 
 
 def incremental(
@@ -166,7 +238,38 @@ def incremental(
     touch only the cells affected by the moved ids; they must not leave stale
     pairs behind from the old cells.
     """
-    raise NotImplementedError
+    moved = set(moved_ids)
+    by_id = {box["id"]: box for box in boxes}
+
+    # Stationary/stationary pairs are still valid: neither endpoint's cell
+    # coverage changed.  Everything touching a moved id is dropped, which also
+    # discards pairs from cells the moved boxes have just vacated.
+    retained = {
+        (min(a, b), max(a, b))
+        for a, b in prev_pairs
+        if a not in moved and b not in moved
+    }
+
+    # Recompute using only the cells the moved boxes currently cover.
+    affected_cells = set()
+    for box_id in moved:
+        if box_id in by_id:
+            affected_cells.update(hash_cells(by_id[box_id], cell))
+
+    buckets: dict[tuple[int, int], list[int]] = {}
+    for box in boxes:
+        for grid_cell in hash_cells(box, cell):
+            if grid_cell in affected_cells:
+                buckets.setdefault(grid_cell, []).append(box["id"])
+
+    recomputed = set()
+    for occupants in buckets.values():
+        for i in range(len(occupants)):
+            for j in range(i + 1, len(occupants)):
+                a, b = occupants[i], occupants[j]
+                recomputed.add((min(a, b), max(a, b)))
+
+    return sorted(retained | recomputed)
 
 
 def validate_pairs(pairs: list[tuple[int, int]], boxes: list[dict]) -> list[str]:
@@ -192,7 +295,46 @@ def validate_pairs(pairs: list[tuple[int, int]], boxes: list[dict]) -> list[str]
     not collapsed).  An empty list means every pair is well-formed, unique and
     at least touching.
     """
-    raise NotImplementedError
+    by_id = {box["id"]: box for box in boxes}
+    seen: set[tuple[int, int]] = set()
+    errors = []
+
+    for a, b in pairs:
+        if a == b:
+            errors.append(f"self:{a}")
+            continue
+
+        if a not in by_id or b not in by_id:
+            absent = min(
+                candidate
+                for candidate in (a, b)
+                if candidate not in by_id
+            )
+            errors.append(f"unknown:{absent}")
+            continue
+
+        normalised = (min(a, b), max(a, b))
+        if normalised in seen:
+            errors.append(f"duplicate:({normalised[0]},{normalised[1]})")
+            continue
+        seen.add(normalised)
+
+        first = by_id[normalised[0]]
+        second = by_id[normalised[1]]
+        disjoint = False
+        for axis in (0, 1):
+            if not (
+                first["max"][axis] + TOL >= second["min"][axis]
+                and second["max"][axis] + TOL >= first["min"][axis]
+            ):
+                disjoint = True
+                break
+        if disjoint:
+            errors.append(
+                f"disjoint:({normalised[0]},{normalised[1]})"
+            )
+
+    return errors
 
 
 def broadphase_batch(frames: list[list[dict]], config: dict) -> dict:
@@ -209,4 +351,11 @@ def broadphase_batch(frames: list[list[dict]], config: dict) -> dict:
     reusing it would make frame 2's result depend on frame 1's geometry.  An
     empty ``frames`` sequence returns ``{}``.
     """
-    raise NotImplementedError
+    if not frames:
+        return {}
+
+    cell = config["cell"]
+    return {
+        frame_index: grid_pairs(frame, cell)
+        for frame_index, frame in enumerate(frames)
+    }
